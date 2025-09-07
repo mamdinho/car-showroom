@@ -1,0 +1,21 @@
+{
+  "name": "cars-service",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p .",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.883.0",
+    "@aws-sdk/client-s3": "^3.883.0",
+    "@aws-sdk/lib-dynamodb": "^3.883.0",
+    "@aws-sdk/s3-request-presigner": "^3.883.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.1",
+    "typescript": "^5.9.2"
+  }
+}
