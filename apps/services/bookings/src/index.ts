@@ -1,82 +1,110 @@
-import { randomUUID } from "node:crypto";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand, QueryCommand, TransactWriteCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
-import { CreateBookingSchema, UpdateBookingSchema } from "./types.js";
-import { getAuthContext } from "./auth.js";
+import {
+  DynamoDBDocumentClient,
+  PutCommand,
+  GetCommand,
+  UpdateCommand,
+  ScanCommand,
+} from "@aws-sdk/lib-dynamodb";
+import { randomUUID } from "node:crypto";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const BOOKINGS_TABLE = process.env.BOOKINGS_TABLE!;
-const LOCK_PREFIX = "LOCK#"; // lock rows prevent double-booking
+const CARS_TABLE = process.env.CARS_TABLE || "";
 
 function json(status: number, data: any) {
-  return { statusCode: status, body: JSON.stringify(data), headers: { "content-type": "application/json" } };
+  return { statusCode: status, headers: { "content-type": "application/json" }, body: JSON.stringify(data) };
 }
 const bad = (m: string) => json(400, { error: m });
 const forb = () => json(403, { error: "forbidden" });
 const notf = () => json(404, { error: "not found" });
 
+function toArrayFlexible(v: any): string[] {
+  if (v == null) return [];
+  if (Array.isArray(v)) return v.map(String);
+  if (typeof v === "string") {
+    const s = v.trim();
+    if (s.startsWith("[") && s.endsWith("]")) {
+      try { const a = JSON.parse(s.replace(/'/g, '"')); if (Array.isArray(a)) return a.map(String); } catch {}
+    }
+    return s.split(/[,\s]+/).map(t => t.trim()).filter(Boolean);
+  }
+  return [String(v)];
+}
+
+function getAuthContext(event: any) {
+  const claims = event?.requestContext?.authorizer?.jwt?.claims
+              || event?.requestContext?.authorizer?.claims
+              || {};
+  const rawGroups = claims["cognito:groups"] ?? claims["cognito:groups[]"] ?? claims["groups"] ?? claims["cognito_groups"];
+  const groups = toArrayFlexible(rawGroups).map(g => g.replace(/^\[|\]$/g, "").toLowerCase());
+  return { userId: claims["sub"] as string | undefined, isAdmin: groups.includes("admin") };
+}
+
+function isIsoDateTime(s: any): boolean {
+  if (typeof s !== "string") return false;
+  const ok = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(s);
+  if (!ok) return false;
+  return !Number.isNaN(Date.parse(s));
+}
+
+// POST /bookings
 async function createBooking(event: any) {
   const { userId } = getAuthContext(event);
   if (!userId) return forb();
 
-  let body: any;
-  try { body = JSON.parse(event.body || "{}"); } catch { return bad("invalid json"); }
-  const parsed = CreateBookingSchema.safeParse(body);
-  if (!parsed.success) return bad(parsed.error.issues.map(i => i.message).join(", "));
-  const { carId, slotTime } = parsed.data;
+  let body: any; try { body = JSON.parse(event.body || "{}"); } catch { return bad("invalid json"); }
+  const carId = body.carId as string | undefined;
+  const slotTime = body.slotTime as string | undefined;
 
-  const bookingId = randomUUID();
-  const lockId = `${LOCK_PREFIX}${carId}#${slotTime}`;
+  if (!carId) return bad("carId is required");
+  if (!slotTime || !isIsoDateTime(slotTime)) return bad("slotTime must be ISO UTC, e.g. 2025-09-08T21:00:00Z");
 
-  // Use a transaction: create a lock row (ensures uniqueness per car+slot) and the booking row
-  try {
-    await ddb.send(new TransactWriteCommand({
-      TransactItems: [
-        {
-          Put: {
-            TableName: BOOKINGS_TABLE,
-            Item: { bookingId: lockId, carId, slotTime, type: "lock" },
-            ConditionExpression: "attribute_not_exists(bookingId)"
-          }
-        },
-        {
-          Put: {
-            TableName: BOOKINGS_TABLE,
-            Item: { bookingId, userId, carId, slotTime, status: "pending", type: "booking", createdAt: new Date().toISOString() },
-            ConditionExpression: "attribute_not_exists(bookingId)"
-          }
-        }
-      ]
-    }));
-  } catch (e: any) {
-    // ConditionalCheckFailedException -> slot already taken
-    return json(409, { error: "slot_unavailable" });
+  if (CARS_TABLE) {
+    try {
+      const g = await ddb.send(new GetCommand({ TableName: CARS_TABLE, Key: { carId } }));
+      if (!g.Item) return bad("unknown carId");
+    } catch (e) {
+      console.log("WARN: car existence check failed:", e);
+    }
   }
 
-  return json(201, { bookingId, userId, carId, slotTime, status: "pending" });
+  const bookingId = randomUUID();
+  const item = {
+    type: "booking",
+    bookingId,
+    userId,
+    carId,
+    slotTime,
+    status: "pending",
+    createdAt: new Date().toISOString(),
+  };
+
+  await ddb.send(new PutCommand({
+    TableName: BOOKINGS_TABLE,
+    Item: item,
+    ConditionExpression: "attribute_not_exists(bookingId)",
+  }));
+
+  return json(201, item);
 }
 
+// GET /bookings/me
 async function listMyBookings(event: any) {
   const { userId } = getAuthContext(event);
   if (!userId) return forb();
 
-  // Prefer GSI "user-index" (PK=userId, SK=slotTime). If not present fallback to scan (not recommended).
-  try {
-    const r = await ddb.send(new QueryCommand({
-      TableName: BOOKINGS_TABLE,
-      IndexName: "user-index",
-      KeyConditionExpression: "userId = :u",
-      ExpressionAttributeValues: { ":u": userId }
-    }));
-    return json(200, (r.Items || []).filter(i => i.type !== "lock"));
-  } catch {
-    // Fallback (will cost more): scan & filter
-    // const r = await ddb.send(new ScanCommand({ TableName: BOOKINGS_TABLE, FilterExpression: "userId = :u", ExpressionAttributeValues: { ":u": userId } }));
-    // return json(200, r.Items || []);
-    return json(500, { error: "user-index GSI missing" });
-  }
+  const r = await ddb.send(new ScanCommand({
+    TableName: BOOKINGS_TABLE,
+    FilterExpression: "#uid = :u",
+    ExpressionAttributeNames: { "#uid": "userId" },
+    ExpressionAttributeValues: { ":u": userId },
+    Limit: 200,
+  }));
+  return json(200, r.Items || []);
 }
 
+// PATCH /bookings/{id}
 async function updateBooking(event: any) {
   const { userId, isAdmin } = getAuthContext(event);
   if (!userId) return forb();
@@ -84,63 +112,55 @@ async function updateBooking(event: any) {
   const id = event?.pathParameters?.id;
   if (!id) return bad("missing id");
 
-  let body: any;
-  try { body = JSON.parse(event.body || "{}"); } catch { return bad("invalid json"); }
-  const parsed = UpdateBookingSchema.safeParse(body);
-  if (!parsed.success) return bad(parsed.error.issues.map(i => i.message).join(", "));
-  const { status } = parsed.data;
+  let body: any; try { body = JSON.parse(event.body || "{}"); } catch { return bad("invalid json"); }
+  const status = body.status as string | undefined;
+  if (!status) return bad("status is required");
 
-  // Fetch booking
-  const get = await ddb.send(new GetCommand({ TableName: BOOKINGS_TABLE, Key: { bookingId: id } }));
-  const item = get.Item;
-  if (!item || item.type === "lock") return notf();
+  const names: Record<string, string> = { "#status": "status", "#ua": "updatedAt" };
+  const values: Record<string, any> = { ":status": status, ":ua": new Date().toISOString() };
+  const setExpr = "SET #status = :status, #ua = :ua";
 
-  // Authorization rules:
-  // - admin can set any status
-  // - owner can set status to "cancelled" only
-  if (!isAdmin && !(item.userId === userId && status === "cancelled")) return forb();
+  const cond = isAdmin ? "attribute_exists(bookingId)" : "attribute_exists(bookingId) AND userId = :u";
+  if (!isAdmin) values[":u"] = userId;
 
-  // Update status
-  const updated = await ddb.send(new UpdateCommand({
+  const r = await ddb.send(new UpdateCommand({
     TableName: BOOKINGS_TABLE,
     Key: { bookingId: id },
-    UpdateExpression: "SET #s = :s",
-    ExpressionAttributeNames: { "#s": "status" },
-    ExpressionAttributeValues: { ":s": status },
-    ReturnValues: "ALL_NEW"
+    UpdateExpression: setExpr,
+    ExpressionAttributeNames: names,
+    ExpressionAttributeValues: values,
+    ConditionExpression: cond,
+    ReturnValues: "ALL_NEW",
   }));
 
-  // If cancelled, free the slot by deleting the lock row
-  if (status === "cancelled") {
-    const lockId = `${LOCK_PREFIX}${item.carId}#${item.slotTime}`;
-    try { await ddb.send(new DeleteCommand({ TableName: BOOKINGS_TABLE, Key: { bookingId: lockId } })); } catch {}
-  }
-
-  return json(200, updated.Attributes);
+  return json(200, r.Attributes);
 }
 
-const routes: Record<string, (e: any) => Promise<any>> = {
-  "POST /bookings": createBooking,
-  "GET /bookings/me": listMyBookings,
-  "PATCH /bookings/{id}": updateBooking
-};
-
+// ---- router (fix: do NOT normalize /bookings/me) ----
 export const handler = async (event: any) => {
-  const method = event.requestContext?.http?.method;
-  const path = event.requestContext?.http?.path;
-
-  // normalize dynamic id for PATCH /bookings/{id}
-  let normPath = path;
-  if (/^\/bookings\/[^/]+$/.test(path)) normPath = "/bookings/{id}";
-
-  const key = `${method} ${normPath}`;
-  const fn = routes[key];
-  if (!fn) return json(404, { error: "route_not_found", key });
-
   try {
-    return await fn(event);
-  } catch (e: any) {
-    console.error(e);
-    return json(500, { error: "internal", message: e?.message });
+    const method: string | undefined = event.requestContext?.http?.method;
+    const path: string | undefined = event.requestContext?.http?.path;
+
+    // Only turn /bookings/<id> into /bookings/{id} if the segment is NOT "me"
+    const norm =
+      path && path.startsWith("/bookings/") && path !== "/bookings/me"
+        ? "/bookings/{id}"
+        : path;
+
+    const key = `${method} ${norm}`;
+    switch (key) {
+      case "POST /bookings":
+        return await createBooking(event);
+      case "GET /bookings/me":
+        return await listMyBookings(event);
+      case "PATCH /bookings/{id}":
+        return await updateBooking(event);
+      default:
+        return json(404, { error: "route_not_found", key });
+    }
+  } catch (err: any) {
+    console.error("UNHANDLED", err);
+    return json(500, { error: "internal", message: err?.message || String(err) });
   }
 };
