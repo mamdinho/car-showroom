@@ -58,8 +58,15 @@ export class CoreStack extends Stack {
       removalPolicy: RemovalPolicy.DESTROY,
     });
 
-    const redirectUri = this.node.tryGetContext("redirectUri") ?? "http://localhost:3000/auth/callback";
-    const logoutUri = this.node.tryGetContext("logoutUri") ?? "http://localhost:3000/";
+    const redirectUri = this.node.tryGetContext("redirectUri") ?? "https://main.d1f7glx4w7rd7j.amplifyapp.com//auth/callback";
+    const logoutUri = this.node.tryGetContext("logoutUri") ?? "https://main.d1f7glx4w7rd7j.amplifyapp.com/";
+
+    const devRedirect = "http://localhost:3000/auth/callback";
+    const devLogout = "http://localhost:3000/";
+
+    // allow both dev and the passed-in (Amplify) URLs
+    const callbackUrls = Array.from(new Set([devRedirect, redirectUri]));
+    const logoutUrls = Array.from(new Set([devLogout, logoutUri]));
 
     const userClient = new cognito.UserPoolClient(this, "UserClient", {
       userPool,
@@ -69,8 +76,8 @@ export class CoreStack extends Stack {
       oAuth: {
         flows: { authorizationCodeGrant: true },
         scopes: [cognito.OAuthScope.OPENID, cognito.OAuthScope.EMAIL, cognito.OAuthScope.PROFILE],
-        callbackUrls: [redirectUri],
-        logoutUrls: [logoutUri],
+        callbackUrls,
+        logoutUrls,
   },
     });
 
