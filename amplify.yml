@@ -3,16 +3,16 @@ frontend:
   phases:
     preBuild:
       commands:
-        - nvm install 20
-        - node -v
+        - cd apps/web
         - npm ci
     build:
       commands:
+        - cd apps/web
         - npm run build
   artifacts:
-    baseDirectory: .next/out
+    baseDirectory: apps/web/.next/out
     files:
       - '**/*'
   cache:
     paths:
-      - node_modules/**/*
+      - apps/web/node_modules/**/*
