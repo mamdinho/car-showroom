@@ -66,16 +66,20 @@ npm install
 
 ### 3️⃣ Environment variables
 # Cognito
+```bash
 NEXT_PUBLIC_REGION=us-east-1
 NEXT_PUBLIC_USER_POOL_ID=your_cognito_user_pool_id
 NEXT_PUBLIC_USER_POOL_CLIENT_ID=your_cognito_client_id
 NEXT_PUBLIC_IDENTITY_POOL_ID=your_identity_pool_id
 NEXT_PUBLIC_COGNITO_DOMAIN=https://your-domain.auth.us-east-1.amazoncognito.com
+```
 
 # App
+```bash
 NEXT_PUBLIC_API_BASE=https://your-api-id.execute-api.us-east-1.amazonaws.com
 NEXT_PUBLIC_CDN_BASE=your-cloudfront-domain-name
 NEXT_PUBLIC_REDIRECT_URI=http://localhost:3000/auth/callback
+```
 
 ### 4️⃣ Deploy infrastructure
 ```bash
